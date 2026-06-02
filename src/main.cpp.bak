@@ -1,0 +1,456 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+
+#define LOG(x) Serial.println(x)
+#define LOGF(...) Serial.printf(__VA_ARGS__)
+
+const char* ssid = "Jendeukie";
+const char* password = "thaongan";
+
+WebServer server(80);
+WebSocketsServer webSocket(81);
+
+#define S1 26
+#define S2 25
+#define S3 32
+#define S4 33
+#define S5 27
+
+#define ENA 21
+#define IN1 22
+#define IN2 23
+#define IN3 18
+#define IN4 19
+#define ENB 5
+
+#define SPEED 180
+#define TURN_SPEED 120
+
+int graph[20][4] = {
+  {1,5,-1,-1},{0,6,-1,-1},{3,7,-1,-1},{2,4,8,-1},{3,9,-1,-1},
+  {0,6,10,-1},{1,5,7,11},{2,6,8,12},{3,7,9,13},{4,8,14,-1},
+  {5,11,15,-1},{6,10,12,16},{7,11,13,17},{8,12,14,18},{9,13,19,-1},
+  {10,16,-1,-1},{11,15,-1,-1},{12,18,-1,-1},{13,17,19,-1},{14,18,-1,-1}
+};
+
+int path[50];
+int pathLength = 0;
+int currentIndex = 0;
+
+bool moving = false;
+unsigned long lastNodeTime = 0;
+
+String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Robot AI</title>
+<style>
+body{font-family:Arial;text-align:center;background:#111;color:white;}
+.node{width:50px;height:50px;border-radius:50%;background:#333;display:inline-block;margin:5px;line-height:50px;cursor:pointer;}
+.start{background:green;}
+.end{background:red;}
+.path{background:orange;}
+.current{background:blue;}
+#log{width:80%;height:150px;background:#000;margin:20px auto;overflow:auto;padding:10px;font-size:12px;}
+</style>
+</head>
+<body>
+
+<h2>Car</h2>
+
+<select id="algo">
+<option value="bfs">BFS</option>
+<option value="dfs">DFS</option>
+<option value="astar">A*</option>
+</select>
+
+<button onclick="run()">RUN</button>
+<button onclick="location.reload()">RESET</button>
+
+<div id="grid"></div>
+<div id="log"></div>
+
+<script>
+let ws=new WebSocket("ws://"+location.hostname+":81");
+let start=null,end=null;
+
+for(let i=0;i<20;i++){
+ let d=document.createElement("div");
+ d.className="node";
+ d.innerText=i;
+ d.onclick=()=>select(i);
+ d.id="n"+i;
+ document.getElementById("grid").appendChild(d);
+}
+
+function select(i){
+ if(start==null){
+   start=i;
+   document.getElementById("n"+i).classList.add("start");
+ }
+ else if(end==null){
+   end=i;
+   document.getElementById("n"+i).classList.add("end");
+ }
+}
+
+function run(){
+ ws.send(JSON.stringify({start:start,end:end,algo:algo.value}));
+}
+
+ws.onmessage=(msg)=>{
+ let data=JSON.parse(msg.data);
+
+ if(data.path){
+  document.querySelectorAll(".node").forEach(n=>n.classList.remove("path"));
+  data.path.forEach(i=>document.getElementById("n"+i).classList.add("path"));
+ }
+
+ if(data.node!=undefined){
+  document.querySelectorAll(".node").forEach(n=>n.classList.remove("current"));
+  document.getElementById("n"+data.node).classList.add("current");
+ }
+
+ if(data.log){
+  let log=document.getElementById("log");
+  log.innerHTML+=data.log+"<br>";
+  log.scrollTop=log.scrollHeight;
+ }
+};
+</script>
+</body>
+</html>
+)rawliteral";
+
+void sendNode(int n){
+  JsonDocument doc;
+  doc["node"] = n;
+  String msg;
+  serializeJson(doc, msg);
+  webSocket.broadcastTXT(msg);
+}
+
+void sendLog(String t){
+  JsonDocument doc;
+  doc["log"] = t;
+  String msg;
+  serializeJson(doc, msg);
+  webSocket.broadcastTXT(msg);
+}
+
+void setMotor(int L, int R){
+  digitalWrite(IN3, L > 0 ? LOW : HIGH);
+  digitalWrite(IN4, L > 0 ? HIGH : LOW);
+  digitalWrite(IN1, R > 0 ? LOW : HIGH);
+  digitalWrite(IN2, R > 0 ? HIGH : LOW);
+
+  ledcWrite(ENA, abs(R));
+  ledcWrite(ENB, abs(L));
+}
+
+void stopMotor(){
+  ledcWrite(ENA, 0);
+  ledcWrite(ENB, 0);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+int readLine(){
+  if(digitalRead(S3)==1) return 0;
+  if(digitalRead(S2)==1) return -1;
+  if(digitalRead(S1)==1) return -2;
+  if(digitalRead(S4)==1) return 1;
+  if(digitalRead(S5)==1) return 2;
+  return 99;
+}
+
+void followLine(){
+  int p = readLine();
+
+  if(p == 0) setMotor(SPEED, SPEED);
+  else if(p < 0) setMotor(SPEED - 80, SPEED);
+  else if(p > 0) setMotor(SPEED, SPEED - 80);
+  else stopMotor();
+}
+
+
+bool isNode(){
+  return digitalRead(S2)==1 &&
+         digitalRead(S3)==1 &&
+         digitalRead(S4)==1;
+}
+
+void bfs(int s,int e){
+  bool vis[20]={0};
+  int parent[20];
+  for(int i=0;i<20;i++) parent[i]=-1;
+
+  int q[50],f=0,r=0;
+  q[r++]=s;
+  vis[s]=1;
+
+  while(f<r){
+    int u=q[f++];
+    if(u==e) break;
+
+    for(int i=0;i<4;i++){
+      int v=graph[u][i];
+      if(v!=-1 && !vis[v]){
+        vis[v]=1;
+        parent[v]=u;
+        q[r++]=v;
+      }
+    }
+  }
+
+  pathLength=0;
+  for(int v=e;v!=-1;v=parent[v]){
+    path[pathLength++]=v;
+  }
+
+  for(int i=0;i<pathLength/2;i++){
+    int t=path[i];
+    path[i]=path[pathLength-1-i];
+    path[pathLength-1-i]=t;
+  }
+}
+
+bool dfsUtil(int u,int e,bool vis[],int parent[]){
+  vis[u]=1;
+  if(u==e) return true;
+
+  for(int i=0;i<4;i++){
+    int v=graph[u][i];
+    if(v!=-1 && !vis[v]){
+      parent[v]=u;
+      if(dfsUtil(v,e,vis,parent)) return true;
+    }
+  }
+  return false;
+}
+
+void dfs(int s,int e){
+  bool vis[20]={0};
+  int parent[20];
+  for(int i=0;i<20;i++) parent[i]=-1;
+
+  dfsUtil(s,e,vis,parent);
+
+  pathLength=0;
+  for(int v=e;v!=-1;v=parent[v]){
+    path[pathLength++]=v;
+  }
+
+  for(int i=0;i<pathLength/2;i++){
+    int t=path[i];
+    path[i]=path[pathLength-1-i];
+    path[pathLength-1-i]=t;
+  }
+}
+
+int h(int a,int b){
+  return abs(a-b);
+}
+
+void astar(int s,int e){
+  bool vis[20]={0};
+  int parent[20],g[20];
+
+  for(int i=0;i<20;i++){
+    parent[i]=-1;
+    g[i]=9999;
+  }
+
+  g[s]=0;
+
+  for(int k=0;k<20;k++){
+    int u=-1,best=9999;
+
+    for(int i=0;i<20;i++){
+      if(!vis[i] && g[i]+h(i,e)<best){
+        best=g[i]+h(i,e);
+        u=i;
+      }
+    }
+
+    if(u==-1) break;
+
+    vis[u]=1;
+
+    for(int i=0;i<4;i++){
+      int v=graph[u][i];
+      if(v!=-1 && g[u]+1<g[v]){
+        g[v]=g[u]+1;
+        parent[v]=u;
+      }
+    }
+  }
+
+  pathLength=0;
+  for(int v=e;v!=-1;v=parent[v]){
+    path[pathLength++]=v;
+  }
+
+  for(int i=0;i<pathLength/2;i++){
+    int t=path[i];
+    path[i]=path[pathLength-1-i];
+    path[pathLength-1-i]=t;
+  }
+}
+
+String getDir(int a,int b){
+  if(b==a+5) return "DOWN";
+  if(b==a-5) return "UP";
+  if(b==a+1) return "RIGHT";
+  if(b==a-1) return "LEFT";
+  return "";
+}
+
+void turnLeft(){
+  unsigned long startTime = millis();
+  setMotor(-TURN_SPEED, TURN_SPEED);
+
+  while(digitalRead(S3)==0){
+    webSocket.loop();
+    server.handleClient();
+
+    if(millis() - startTime > 1000){
+      break;
+    }
+  }
+
+  stopMotor();
+  delay(100);
+}
+
+void turnRight(){
+  unsigned long startTime = millis();
+  setMotor(TURN_SPEED, -TURN_SPEED);
+
+  while(digitalRead(S3)==0){
+    webSocket.loop();
+    server.handleClient();
+
+    if(millis() - startTime > 1000){
+      break;
+    }
+  }
+
+  stopMotor();
+  delay(100);
+}
+
+void onWS(uint8_t n,WStype_t t,uint8_t *p,size_t l){
+  if(t==WStype_TEXT){
+    JsonDocument doc;
+    deserializeJson(doc,p);
+
+    int s=doc["start"];
+    int e=doc["end"];
+    String algo=doc["algo"];
+
+    if(algo=="bfs") bfs(s,e);
+    else if(algo=="dfs") dfs(s,e);
+    else astar(s,e);
+
+    JsonDocument res;
+    JsonArray arr=res["path"].to<JsonArray>();
+
+    for(int i=0;i<pathLength;i++){
+      arr.add(path[i]);
+    }
+
+    String out;
+    serializeJson(res,out);
+    webSocket.broadcastTXT(out);
+
+    currentIndex = 0;
+    moving = true;
+    lastNodeTime = 0;
+
+    sendLog("START");
+  }
+}
+
+void setup(){
+  Serial.begin(115200);
+
+  pinMode(S1,INPUT);
+  pinMode(S2,INPUT);
+  pinMode(S3,INPUT);
+  pinMode(S4,INPUT);
+  pinMode(S5,INPUT);
+
+  pinMode(IN1,OUTPUT);
+  pinMode(IN2,OUTPUT);
+  pinMode(IN3,OUTPUT);
+  pinMode(IN4,OUTPUT);
+
+  pinMode(ENA,OUTPUT);
+  pinMode(ENB,OUTPUT);
+
+  ledcAttach(ENA,1000,8);
+  ledcAttach(ENB,1000,8);
+
+  WiFi.begin(ssid,password);
+
+  while(WiFi.status()!=WL_CONNECTED){
+    delay(500);
+    Serial.print(".");
+  }
+
+  LOG("\nWiFi OK");
+  LOG(WiFi.localIP());
+
+  server.on("/",[](){
+    server.send(200,"text/html",html);
+  });
+
+  server.begin();
+
+  webSocket.begin();
+  webSocket.onEvent(onWS);
+}
+
+void loop(){
+  server.handleClient();
+  webSocket.loop();
+
+  if(moving && pathLength > 1){
+    followLine();
+
+    if(isNode() && millis() - lastNodeTime > 500){
+      lastNodeTime = millis();
+
+      int from = path[currentIndex];
+      int to = path[currentIndex + 1];
+
+      String dir = getDir(from,to);
+
+      sendNode(to);
+
+      if(dir=="LEFT"){
+        turnLeft();
+      }
+      else if(dir=="RIGHT"){
+        turnRight();
+      }
+
+      currentIndex++;
+
+      if(currentIndex >= pathLength - 1){
+        stopMotor();
+        moving = false;
+        sendLog("FINISH");
+        pathLength = 0;
+      }
+    }
+  }
+}
